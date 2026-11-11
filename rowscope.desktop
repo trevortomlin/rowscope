@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Rowscope
+GenericName=Spreadsheet Viewer
+Comment=View, search and filter CSV and Excel files with millions of rows
+Exec=rowscope %F
+Icon=rowscope
+Terminal=false
+Categories=Office;Spreadsheet;Viewer;
+MimeType=text/csv;text/tab-separated-values;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/vnd.ms-excel.sheet.macroEnabled.12;application/vnd.ms-excel.sheet.binary.macroEnabled.12;application/vnd.ms-excel;application/vnd.oasis.opendocument.spreadsheet;
+Keywords=csv;tsv;xlsx;excel;spreadsheet;table;filter;
+StartupWMClass=rowscope

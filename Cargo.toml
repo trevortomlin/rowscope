@@ -1,0 +1,53 @@
+[package]
+name = "rowscope"
+version = "0.1.0"
+edition = "2024"
+authors = ["Trevor Tomlin"]
+description = "A fast spreadsheet viewer and filter for CSV and Excel files with millions of rows, built on GPUI Fast"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/trevortomlin/rowscope"
+homepage = "https://github.com/trevortomlin/rowscope"
+keywords = ["csv", "xlsx", "spreadsheet", "viewer", "gpui"]
+categories = ["visualization", "gui"]
+publish = false
+
+[[bin]]
+name = "rowscope"
+path = "src/main.rs"
+
+[dependencies]
+# gpui-fast pinned to the same commit as filebrowserrs and taskmanager-rs. Bump `rev` deliberately.
+gpui = { git = "https://github.com/trevortomlin/gpui-fast", rev = "2c472d8e55426ad988a6d0d6f0c2f677a6c2dc53" }
+gpui_platform = { git = "https://github.com/trevortomlin/gpui-fast", rev = "2c472d8e55426ad988a6d0d6f0c2f677a6c2dc53", features = ["wayland", "x11"] }
+anyhow = "1"
+libc = "0.2"
+memmap2 = "0.9"
+memchr = "2.7"
+rayon = "1.10"
+aho-corasick = "1.1"
+regex = "1.11"
+rustc-hash = "2"
+calamine = "0.38"
+futures = "0.3"
+unicode-segmentation = "1.13"
+
+# Only for `--features snapshot`: offscreen rendering of the UI to PNG files.
+gpui_wgpu = { git = "https://github.com/trevortomlin/gpui-fast", rev = "2c472d8e55426ad988a6d0d6f0c2f677a6c2dc53", package = "gpui_wgpu", optional = true }
+
+[features]
+snapshot = ["gpui/test-support", "gpui_platform/test-support", "dep:gpui_wgpu"]
+
+# gpui is far too slow unoptimized; optimize dependencies even in dev builds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
