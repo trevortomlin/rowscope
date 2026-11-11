@@ -374,6 +374,8 @@ impl Sheet {
                 self.data = data;
                 self.loading = None;
                 self.load_elapsed = Some(elapsed);
+                cx.background_spawn(async { crate::data::release_free_memory() })
+                    .detach();
                 // Re-guess with a sample spread over the whole file.
                 self.setup_columns(self.columns_ready);
                 if !self.query.is_identity() {
@@ -658,7 +660,10 @@ impl Sheet {
         self.query_error = None;
         let cursor_col = self.cursor.1;
         if self.query.is_identity() {
-            self.view = View::All;
+            if matches!(std::mem::replace(&mut self.view, View::All), View::Rows(_)) {
+                cx.background_spawn(async { crate::data::release_free_memory() })
+                    .detach();
+            }
             self.query_running = false;
             self.query_elapsed = None;
             self._query_task = None;
@@ -710,6 +715,10 @@ impl Sheet {
                 }
             })
             .ok();
+            // The job's scratch space and the previous view are freed now.
+            executor
+                .spawn(async { crate::data::release_free_memory() })
+                .await;
         }));
         cx.emit(SheetEvent::Changed);
         cx.notify();

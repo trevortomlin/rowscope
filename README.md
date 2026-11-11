@@ -67,17 +67,22 @@ It's part of a family of fast Linux apps that share one look:
 
 10,000,000 rows × 11 columns, 879 MB CSV, 8 threads, file in the page cache:
 
-| | Time |
-| --- | --- |
-| First rows on screen | 11 ms |
-| Whole file indexed | 112 ms (40 MB index) |
-| Search all cells | 80 ms |
-| Text filter (`city = Paris`) | 106 ms |
-| Number filter (`total > 5000`, 4.2 M matches) | 310 ms |
-| Search + filter + sort, together | 133 ms |
-| Sort by number / by text | 0.50 s / 0.61 s |
-| Distinct values of a column | 90 ms |
-| Sum/avg/min/max over 30 M cells | 0.38 s |
+| | Time | Peak extra memory |
+| --- | --- | --- |
+| First rows on screen | 12 ms | |
+| Whole file indexed | 72 ms (40 MB index) | |
+| Search all cells | 74 ms | |
+| Text filter (`city = Paris`) | 86 ms | |
+| Number filter (`total > 5000`, 4.2 M matches) | 179 ms | 30 MB |
+| Search + filter + sort, together | 121 ms | 15 MB |
+| Sort by number / by text | 0.32 s / 0.23 s | 190 MB / 155 MB |
+| Distinct values of a column | 86 ms | |
+| Sum/avg/min/max over 30 M cells | 0.24 s | |
+| Export all rows to CSV | 0.24 s | |
+
+Peak extra memory is heap on top of the index while the job runs; it is handed back to the
+system when the job ends. Text sorts on columns with few distinct values (names, cities,
+dates) rank each value once and sort 8-byte integers.
 
 A 300,000-row XLSX streams its first rows in 0.25 s and finishes in 1.5 s.
 

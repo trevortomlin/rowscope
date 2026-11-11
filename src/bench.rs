@@ -2,6 +2,9 @@
 //!
 //!   rowscope --bench gen OUT.csv ROWS     write a synthetic CSV
 //!   rowscope --bench FILE [SEARCH]        time load, search, filter, sort
+//!
+//! Each step reports its time and its peak resident anonymous memory (the
+//! heap, not the mapped file). `KEEP_EXPORT=1` keeps the exported CSV.
 
 use std::io::Write;
 use std::path::Path;
@@ -113,7 +116,50 @@ fn generate(path: &Path, rows: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Resident anonymous memory (heap, stacks; not the mapped file) in KiB.
+fn rss_anon_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("RssAnon:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// Samples [`rss_anon_kib`] every millisecond so each step can report the
+/// peak it reached.
+struct MemProbe {
+    peak: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl MemProbe {
+    fn start() -> MemProbe {
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(rss_anon_kib()));
+        let p = peak.clone();
+        std::thread::spawn(move || {
+            loop {
+                p.fetch_max(rss_anon_kib(), std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        MemProbe { peak }
+    }
+    /// Peak since the last call, in MB, then resets to the current level.
+    fn take(&self) -> f64 {
+        let p = self
+            .peak
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(rss_anon_kib());
+        self.peak
+            .store(rss_anon_kib(), std::sync::atomic::Ordering::Relaxed);
+        p as f64 / 1024.0
+    }
+}
+
 fn bench(path: &Path, search: Option<&str>) {
+    let mem = MemProbe::start();
     let t0 = Instant::now();
     let rx = data::spawn_load(path.to_path_buf(), None, Default::default());
     let mut rx = rx;
@@ -139,22 +185,31 @@ fn bench(path: &Path, search: Option<&str>) {
         eprintln!("first {n} rows visible after {t:.2?}");
     }
     eprintln!(
-        "loaded {} rows in {load:.2?} ({:.1} MB index)",
+        "loaded {} rows in {load:.2?} ({:.1} MB index, peak {:.0} MB anon)",
         data.rows,
-        data.heap_bytes() as f64 / 1e6
+        data.heap_bytes() as f64 / 1e6,
+        mem.take()
     );
     let cancel = AtomicBool::new(false);
     let edits = Edits::default();
     let ncols = data.row_fields(0, 1000).len();
     let time = |label: &str, q: Query| {
+        mem.take();
         let t = Instant::now();
         let r = query::run(&data, 1, &q, &edits, ncols, &cancel)
             .unwrap()
             .unwrap();
+        let el = t.elapsed();
+        let n = r.rows.len();
+        drop(r);
+        // As the app does when a job finishes.
+        data::release_free_memory();
         eprintln!(
-            "{label:<34} {:>10} rows  {:>9.2?}",
-            r.rows.len(),
-            t.elapsed()
+            "{label:<34} {:>10} rows  {:>9.2?}  peak {:>5.0} MB, {:>4.0} MB after",
+            n,
+            el,
+            mem.take(),
+            rss_anon_kib() as f64 / 1024.0
         );
     };
     time(
@@ -220,17 +275,63 @@ fn bench(path: &Path, search: Option<&str>) {
             ..Default::default()
         },
     );
+    time(
+        "sort col 0 (text, all distinct)",
+        Query {
+            sort: Some(SortSpec {
+                col: 0,
+                desc: false,
+                numeric: false,
+            }),
+            ..Default::default()
+        },
+    );
+    time(
+        "search + filter + sort",
+        Query {
+            search: "tokyo".into(),
+            filters: vec![ColFilter {
+                col: 9,
+                cond: Cond::Num {
+                    op: NumOp::Gt,
+                    a: 5000.,
+                    b: 0.,
+                },
+            }],
+            sort: Some(SortSpec {
+                col: 2,
+                desc: false,
+                numeric: false,
+            }),
+        },
+    );
+    time(
+        "text filter col 6 contains 'ship'",
+        Query {
+            filters: vec![ColFilter {
+                col: 6,
+                cond: Cond::Text {
+                    op: TextOp::Contains,
+                    needle: "ship".into(),
+                },
+            }],
+            ..Default::default()
+        },
+    );
+    mem.take();
     let t = Instant::now();
     let d = query::distinct(&data, 1, None, 3, false, &edits, &cancel).unwrap();
     eprintln!(
-        "{:<34} {:>10} vals  {:>9.2?}",
+        "{:<34} {:>10} vals  {:>9.2?}  peak {:>5.0} MB",
         "distinct col 3",
         d.values.len(),
-        t.elapsed()
+        t.elapsed(),
+        mem.take()
     );
     // Export every row (the raw-copy path) and a search result.
     let out = path.with_extension("export-test.csv");
     let progress = std::sync::atomic::AtomicU64::new(0);
+    mem.take();
     let t = Instant::now();
     let n = query::export_csv(
         &out,
@@ -246,10 +347,11 @@ fn bench(path: &Path, search: Option<&str>) {
     )
     .unwrap();
     eprintln!(
-        "{:<34} {:>10} rows  {:>9.2?}",
+        "{:<34} {:>10} rows  {:>9.2?}  peak {:>5.0} MB",
         "export all rows",
         n,
-        t.elapsed()
+        t.elapsed(),
+        mem.take()
     );
     let same = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     eprintln!(
@@ -257,13 +359,17 @@ fn bench(path: &Path, search: Option<&str>) {
         same,
         std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
     );
-    let _ = std::fs::remove_file(&out);
+    if std::env::var_os("KEEP_EXPORT").is_none() {
+        let _ = std::fs::remove_file(&out);
+    }
+    mem.take();
     let t = Instant::now();
     let st = query::stats(&data, 1, 0..data.rows - 1, 7..10, &|r| r, &edits, &cancel).unwrap();
     eprintln!(
-        "{:<34} {:>10} nums  {:>9.2?}",
+        "{:<34} {:>10} nums  {:>9.2?}  peak {:>5.0} MB",
         "stats cols 7..10 all rows",
         st.nums,
-        t.elapsed()
+        t.elapsed(),
+        mem.take()
     );
 }

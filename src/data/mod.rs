@@ -144,6 +144,18 @@ impl Data {
         }
     }
 
+    /// Where physical row `row` of a mapped file lies in the map, without
+    /// its line ending.
+    #[inline]
+    pub fn row_span(&self, row: u64) -> (usize, usize) {
+        let chunk = &self.chunks[(row >> CHUNK_SHIFT) as usize];
+        let i = (row & CHUNK_MASK) as usize;
+        let s = chunk.offsets.get(i) as usize;
+        let e = chunk.offsets.get(i + 1) as usize;
+        let map = self.map.as_deref().map(|m| &m[..]).unwrap_or(&[]);
+        (s, s + trim_eol(&map[s..e]).len())
+    }
+
     /// The bytes of a whole chunk and its offsets, for scanning many rows at
     /// once (search).
     pub fn chunk_bytes(&self, ci: usize) -> (&[u8], &Chunk) {
@@ -219,6 +231,18 @@ fn trim_eol(b: &[u8]) -> &[u8] {
     &b[..e]
 }
 
+/// Hands memory freed by a finished job back to the system. The sorts and
+/// filters allocate and free hundreds of MB across threads, and glibc keeps
+/// much of it in its arenas otherwise. Takes a few ms; call it off the UI
+/// thread.
+pub fn release_free_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim has no preconditions.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 pub fn lossy(b: &[u8]) -> Cow<'_, str> {
     String::from_utf8_lossy(b)
 }
@@ -259,6 +283,22 @@ impl ChunkBuilder {
         }
         self.starts.push(start);
         self.rows += 1;
+    }
+
+    /// Adds rows starting at `base` plus each of `list`, in order.
+    pub fn push_starts(&mut self, base: u64, mut list: &[u32]) {
+        while let Some(&d) = list.first() {
+            if self.starts.len() == CHUNK_ROWS {
+                self.push_start(base + d as u64);
+                list = &list[1..];
+                continue;
+            }
+            let n = (CHUNK_ROWS - self.starts.len()).min(list.len());
+            self.starts
+                .extend(list[..n].iter().map(|&d| base + d as u64));
+            self.rows += n as u64;
+            list = &list[n..];
+        }
     }
 
     /// The finished chunks plus the partial one ending at `end`.
@@ -346,6 +386,23 @@ mod tests {
         }
         let end = (CHUNK_ROWS as u64 * 2 + 5) * 10;
         let chunks = b.snapshot(end);
+        // Pushing in batches of any size builds the same chunks.
+        for step in [1, 7, CHUNK_ROWS - 1, CHUNK_ROWS, CHUNK_ROWS + 3] {
+            let all: Vec<u32> = (0..(CHUNK_ROWS as u32 * 2 + 5)).map(|i| i * 10).collect();
+            let mut c = ChunkBuilder::new();
+            for part in all.chunks(step) {
+                c.push_starts(0, part);
+            }
+            assert_eq!(c.rows, b.rows);
+            let got = c.snapshot(end);
+            assert_eq!(got.len(), chunks.len());
+            for (g, w) in got.iter().zip(&chunks) {
+                assert_eq!(g.rows(), w.rows());
+                for i in 0..=g.rows() {
+                    assert_eq!(g.offsets.get(i), w.offsets.get(i));
+                }
+            }
+        }
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].rows(), CHUNK_ROWS);
         assert_eq!(chunks[2].rows(), 5);

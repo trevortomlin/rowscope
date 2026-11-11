@@ -156,7 +156,10 @@ impl ColumnMenu {
             } else {
                 None
             };
-            query::distinct(&data, first, rows.as_deref(), col, numeric, &edits, &cancel).map(Ok)
+            let d = query::distinct(&data, first, rows.as_deref(), col, numeric, &edits, &cancel);
+            drop(rows);
+            crate::data::release_free_memory();
+            d.map(Ok)
         });
         menu._task = Some(cx.spawn(async move |this, cx| {
             let r = job.await;

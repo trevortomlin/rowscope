@@ -37,7 +37,10 @@ pub fn parse_number(raw: &[u8]) -> Option<f64> {
     if b.is_empty() || b.len() > 64 {
         return None;
     }
-    // Fast path: plain digits.
+    if let Some(v) = parse_plain(b) {
+        return Some(v);
+    }
+    // Plain digits the quick parser can't take exactly (long, exponents).
     if let Ok(s) = std::str::from_utf8(b)
         && let Some(c) = s.as_bytes().first()
         && (c.is_ascii_digit() || *c == b'-' || *c == b'.' || *c == b'+')
@@ -105,6 +108,47 @@ pub fn parse_number(raw: &[u8]) -> Option<f64> {
     }
     let v: f64 = s.parse().ok()?;
     let v = if pct { v / 100.0 } else { v };
+    Some(if neg { -v } else { v })
+}
+
+/// Powers of ten that are exact in an f64.
+const POW10: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+];
+
+/// `[+-]digits[.digits]` with at most 15 significant digits, the common case
+/// in data files. With the mantissa below 2^53 and an exact power of ten, one
+/// division is correctly rounded (Clinger's fast path), so this gives the
+/// same result as `str::parse`. Anything else returns `None`.
+#[inline]
+fn parse_plain(b: &[u8]) -> Option<f64> {
+    let (neg, digits) = match b[0] {
+        b'-' => (true, &b[1..]),
+        b'+' => (false, &b[1..]),
+        _ => (false, b),
+    };
+    if digits.is_empty() || digits.len() > 16 {
+        return None;
+    }
+    let mut m: u64 = 0;
+    let mut frac: Option<usize> = None;
+    let mut nd = 0usize;
+    for (i, &c) in digits.iter().enumerate() {
+        match c {
+            b'0'..=b'9' => {
+                m = m * 10 + (c - b'0') as u64;
+                nd += 1;
+            }
+            b'.' if frac.is_none() => frac = Some(i + 1),
+            _ => return None,
+        }
+    }
+    if nd == 0 || nd > 15 {
+        return None;
+    }
+    let scale = frac.map_or(0, |f| digits.len() - f);
+    let v = m as f64 / POW10[scale];
     Some(if neg { -v } else { v })
 }
 
@@ -303,6 +347,37 @@ pub fn parse_col_name(s: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_numbers_match_std() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let digits = 1 + (x % 15) as usize;
+            let mut s = String::new();
+            if x & (1 << 40) != 0 {
+                s.push('-');
+            }
+            let mut y = x >> 8;
+            for _ in 0..digits {
+                s.push((b'0' + (y % 10) as u8) as char);
+                y /= 10;
+            }
+            let dot = (x >> 50) as usize % (digits + 2);
+            if dot <= digits {
+                s.insert(s.len() - digits + dot, '.');
+            }
+            let want: f64 = s.parse().unwrap();
+            let got = parse_plain(s.as_bytes()).unwrap();
+            assert_eq!(got.to_bits(), want.to_bits(), "{s}");
+        }
+        assert_eq!(parse_plain(b"1234567890123456"), None);
+        assert_eq!(parse_plain(b"."), None);
+        assert_eq!(parse_plain(b"1.2.3"), None);
+        assert_eq!(parse_number(b"1234567890123456"), Some(1234567890123456.0));
+    }
 
     #[test]
     fn numbers() {

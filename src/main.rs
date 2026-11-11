@@ -123,11 +123,14 @@ fn open_window(paths: Vec<PathBuf>, cx: &mut App) {
 }
 
 fn main() {
-    // A few malloc arenas keep the footprint low; the worker threads barely
-    // allocate.
+    // A few malloc arenas keep the footprint low. A fixed mmap threshold
+    // gives the per-thread scratch buffers of sorts and filters (1 MB and up)
+    // straight back to the system when freed; by default glibc raises the
+    // threshold after the first big free and keeps them in its arenas.
     #[cfg(target_os = "linux")]
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 4);
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--bench") {

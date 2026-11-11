@@ -80,10 +80,9 @@ fn row_with_edits<'a>(
 
 /// Trimmed cell values, for value-list filters.
 pub type ValueSet = Arc<FxHashSet<Box<[u8]>>>;
-/// Sort keys of one part of the rows: numbers with positions, and the rest.
-type NumPart = (Vec<(u64, u32)>, Vec<u32>);
-/// Lowercase text keys of one part of the rows: an arena and spans into it.
-type TextPart = (Vec<u8>, Vec<(u32, u32)>);
+/// Lowercase text keys of one part of the rows: an arena and where each
+/// key ends in it.
+type TextPart = (Vec<u8>, Vec<u32>);
 
 // ── Conditions ──────────────────────────────────────────────────────────
 
@@ -381,6 +380,8 @@ impl Compiled {
             };
             tests.push((f.col, t));
         }
+        // In column order, so a row is checked as its fields are split.
+        tests.sort_by_key(|(c, _)| *c);
         let max_col = tests.iter().map(|(c, _)| c + 1).max().unwrap_or(0);
         Ok(Compiled {
             search,
@@ -391,19 +392,23 @@ impl Compiled {
     }
 
     fn row_passes_tests(&self, data: &Data, phys: u64) -> bool {
-        if self.tests.is_empty() {
-            return true;
+        match &self.tests[..] {
+            [] => true,
+            [(c, t)] => t.test(&data.cell(phys, *c)),
+            tests => {
+                // Tests are in column order; check each as its field goes by.
+                let mut next = 0;
+                let mut pass = true;
+                data.for_each_field(phys, self.max_col, |i, v| {
+                    while pass && next < tests.len() && tests[next].0 == i {
+                        pass = tests[next].1.test(&v);
+                        next += 1;
+                    }
+                });
+                // Columns past the end of a short row are empty.
+                pass && tests[next..].iter().all(|(_, t)| t.test(&[]))
+            }
         }
-        let mut cells: [Cow<[u8]>; 16] = Default::default();
-        let mut big: Vec<Cow<[u8]>>;
-        let cells: &mut [Cow<[u8]>] = if self.max_col <= 16 {
-            &mut cells[..self.max_col]
-        } else {
-            big = vec![Cow::Borrowed(&[][..]); self.max_col];
-            &mut big[..]
-        };
-        data.for_each_field(phys, self.max_col, |i, v| cells[i] = v);
-        self.tests.iter().all(|(c, t)| t.test(&cells[*c]))
     }
 
     /// The slow path for edited rows: fields with edits applied.
@@ -608,6 +613,23 @@ fn sort_text_level<'k>(
     }
 }
 
+/// Writes the sorted order into `rows`: `ties` are the tie-breakers of the
+/// sorted keys, rows themselves when the view was `ascending` and view
+/// positions otherwise.
+fn finish_sort(rows: &mut Vec<u32>, ascending: bool, ties: impl Iterator<Item = u32>) {
+    if ascending {
+        for (dst, r) in rows.iter_mut().zip(ties) {
+            *dst = r;
+        }
+    } else {
+        let old = std::mem::take(rows);
+        *rows = ties.map(|p| old[p as usize]).collect();
+    }
+}
+
+/// Rows per part when extracting sort keys in parallel.
+const SORT_PART: usize = 1 << 16;
+
 /// Sorts data rows by one column. Empty cells (and, for numeric sorts, cells
 /// that aren't numbers) go last either way; ties keep view order.
 pub fn sort_rows(
@@ -618,60 +640,204 @@ pub fn sort_rows(
     edits: &Edits,
     cancel: &AtomicBool,
 ) -> bool {
-    const PART: usize = 1 << 16;
+    // Every key is paired with a tie-breaker that keeps view order. Views
+    // from `run` are ascending, so the row itself can be the tie-breaker and
+    // the result is read straight off the sorted keys; otherwise it is the
+    // view position, and rows are gathered through it at the end.
+    let ascending = rows.par_windows(2).all(|w| w[0] < w[1]);
+    let tie = |pos: usize, r: u32| if ascending { r } else { pos as u32 };
     if s.numeric {
-        // (key, position) for numbers; positions of the rest, in order.
-        let parts: Vec<NumPart> = rows
-            .par_chunks(PART)
+        // Cells that aren't numbers get the largest key, which no number
+        // reaches (see `f64_key`), so they sort last in view order.
+        let mut keyed: Vec<(u64, u32)> = vec![(0, 0); rows.len()];
+        keyed
+            .par_chunks_mut(SORT_PART)
+            .zip(rows.par_chunks(SORT_PART))
             .enumerate()
-            .map(|(pi, part)| {
-                let mut keyed = Vec::with_capacity(part.len());
-                let mut rest = Vec::new();
-                for (j, &r) in part.iter().enumerate() {
-                    let pos = (pi * PART + j) as u32;
+            .for_each(|(pi, (out, part))| {
+                if cancel.load(Relaxed) {
+                    return;
+                }
+                for (j, (o, &r)) in out.iter_mut().zip(part).enumerate() {
                     let v = cell_text(data, edits, r as u64 + first, s.col);
-                    match parse_number(&v) {
+                    let k = match parse_number(&v) {
                         Some(x) if !x.is_nan() => {
                             let k = f64_key(x);
-                            keyed.push((if s.desc { !k } else { k }, pos));
+                            if s.desc { !k } else { k }
                         }
-                        _ => rest.push(pos),
-                    }
+                        _ => u64::MAX,
+                    };
+                    *o = (k, tie(pi * SORT_PART + j, r));
                 }
-                (keyed, rest)
-            })
-            .collect();
+            });
         if cancel.load(Relaxed) {
             return false;
         }
-        let mut keyed: Vec<(u64, u32)> = Vec::with_capacity(rows.len());
-        let mut rest: Vec<u32> = Vec::new();
-        for (k, r) in parts {
-            keyed.extend_from_slice(&k);
-            rest.extend_from_slice(&r);
-        }
         keyed.par_sort_unstable();
-        let sorted: Vec<u32> = keyed
-            .iter()
-            .map(|&(_, pos)| rows[pos as usize])
-            .chain(rest.iter().map(|&pos| rows[pos as usize]))
-            .collect();
-        *rows = sorted;
+        finish_sort(rows, ascending, keyed.iter().map(|&(_, t)| t));
         return true;
     }
-    // Text: lowercase keys in per-part arenas.
+    match sort_text_dict(data, first, rows, s, edits, cancel, &tie) {
+        Some(Some(mut keys)) => {
+            keys.par_sort_unstable();
+            finish_sort(rows, ascending, keys.iter().map(|&k| k as u32));
+            true
+        }
+        Some(None) => false,
+        None => sort_text_arena(data, first, rows, s, edits, cancel, &tie, ascending),
+    }
+}
+
+/// Lowercase keys of one part of the rows, each distinct key stored once.
+struct DictPart {
+    keys: FxHashMap<Box<[u8]>, u32>,
+    /// Per row, the index of its key in `keys` (`u32::MAX` for empty).
+    ids: Vec<u32>,
+}
+
+/// Builds a [`DictPart`], giving up once more than `limit` distinct keys
+/// turn up.
+fn dict_part(
+    data: &Data,
+    first: u64,
+    part: &[u32],
+    col: usize,
+    edits: &Edits,
+    limit: usize,
+) -> Option<DictPart> {
+    let mut keys: FxHashMap<Box<[u8]>, u32> = FxHashMap::default();
+    let mut ids = Vec::with_capacity(part.len());
+    let mut buf = Vec::new();
+    for &r in part {
+        let v = cell_text(data, edits, r as u64 + first, col);
+        buf.clear();
+        lower_key(&v, &mut buf);
+        if buf.is_empty() {
+            ids.push(u32::MAX);
+            continue;
+        }
+        let id = match keys.get(&buf[..]) {
+            Some(&id) => id,
+            None => {
+                if keys.len() >= limit {
+                    return None;
+                }
+                let id = keys.len() as u32;
+                keys.insert(buf.as_slice().into(), id);
+                id
+            }
+        };
+        ids.push(id);
+    }
+    Some(DictPart { keys, ids })
+}
+
+/// The text sort for columns with few distinct values (names, cities,
+/// categories, dates): each distinct key is ranked once, and rows become
+/// 8-byte `rank << 32 | tie-breaker` integers. `None` when the column has
+/// too many distinct values; `Some(None)` when cancelled.
+fn sort_text_dict(
+    data: &Data,
+    first: u64,
+    rows: &[u32],
+    s: SortSpec,
+    edits: &Edits,
+    cancel: &AtomicBool,
+    tie: &(dyn Fn(usize, u32) -> u32 + Sync),
+) -> Option<Option<Vec<u64>>> {
+    // Decide from the first part, and give up on any part that turns out
+    // to be much more varied.
+    let limit = |n: usize| (n / 8).max(256);
+    let head = &rows[..rows.len().min(SORT_PART)];
+    let p0 = dict_part(data, first, head, s.col, edits, limit(head.len()))?;
+    let failed = AtomicBool::new(false);
+    let mut parts: Vec<Option<DictPart>> = rows
+        .par_chunks(SORT_PART)
+        .skip(1)
+        .map(|part| {
+            if failed.load(Relaxed) || cancel.load(Relaxed) {
+                return None;
+            }
+            let p = dict_part(data, first, part, s.col, edits, limit(part.len()));
+            if p.is_none() {
+                failed.store(true, Relaxed);
+            }
+            p
+        })
+        .collect();
+    if cancel.load(Relaxed) {
+        return Some(None);
+    }
+    if failed.load(Relaxed) {
+        return None;
+    }
+    parts.insert(0, Some(p0));
+    let parts: Vec<DictPart> = parts.into_iter().map(Option::unwrap).collect();
+    // Rank every distinct key.
+    let mut all: FxHashMap<&[u8], u32> = FxHashMap::default();
+    for p in &parts {
+        for k in p.keys.keys() {
+            all.entry(&k[..]).or_insert(0);
+        }
+    }
+    let mut sorted: Vec<&[u8]> = all.keys().copied().collect();
+    sorted.par_sort_unstable();
+    let n = sorted.len() as u32;
+    for (rank, k) in sorted.iter().enumerate() {
+        let rank = rank as u32;
+        *all.get_mut(k).unwrap() = if s.desc { n - 1 - rank } else { rank };
+    }
+    // Empty cells rank after every key, both ways.
+    let mut keys: Vec<u64> = vec![0; rows.len()];
+    keys.par_chunks_mut(SORT_PART)
+        .zip(parts.par_iter())
+        .zip(rows.par_chunks(SORT_PART))
+        .enumerate()
+        .for_each(|(pi, ((out, p), part))| {
+            let mut ranks = vec![0u32; p.keys.len()];
+            for (k, &id) in &p.keys {
+                ranks[id as usize] = all[&k[..]];
+            }
+            for (j, ((o, &id), &r)) in out.iter_mut().zip(&p.ids).zip(part).enumerate() {
+                let rank = if id == u32::MAX {
+                    n
+                } else {
+                    ranks[id as usize]
+                };
+                *o = (rank as u64) << 32 | tie(pi * SORT_PART + j, r) as u64;
+            }
+        });
+    Some(Some(keys))
+}
+
+/// The general text sort: lowercase keys in per-part arenas, sorted by an
+/// MSD radix over 8-byte digits.
+#[allow(clippy::too_many_arguments)]
+fn sort_text_arena(
+    data: &Data,
+    first: u64,
+    rows: &mut Vec<u32>,
+    s: SortSpec,
+    edits: &Edits,
+    cancel: &AtomicBool,
+    tie: &(dyn Fn(usize, u32) -> u32 + Sync),
+    ascending: bool,
+) -> bool {
+    // Per part: an arena of keys and where each one ends (it starts where
+    // the previous one ended).
     let parts: Vec<TextPart> = rows
-        .par_chunks(PART)
+        .par_chunks(SORT_PART)
         .map(|part| {
             let mut arena = Vec::new();
-            let mut spans = Vec::with_capacity(part.len());
-            for &r in part {
-                let v = cell_text(data, edits, r as u64 + first, s.col);
-                let at = arena.len();
-                lower_key(&v, &mut arena);
-                spans.push((at as u32, (arena.len() - at) as u32));
+            let mut ends = Vec::with_capacity(part.len());
+            if !cancel.load(Relaxed) {
+                for &r in part {
+                    let v = cell_text(data, edits, r as u64 + first, s.col);
+                    lower_key(&v, &mut arena);
+                    ends.push(arena.len() as u32);
+                }
             }
-            (arena, spans)
+            (arena, ends)
         })
         .collect();
     if cancel.load(Relaxed) {
@@ -679,9 +845,10 @@ pub fn sort_rows(
     }
     let key = |i: u32| -> &[u8] {
         let i = i as usize;
-        let (arena, spans) = &parts[i / PART];
-        let (at, len) = spans[i % PART];
-        &arena[at as usize..(at + len) as usize]
+        let (arena, ends) = &parts[i / SORT_PART];
+        let j = i % SORT_PART;
+        let at = if j == 0 { 0 } else { ends[j - 1] as usize };
+        &arena[at..ends[j] as usize]
     };
     let mut items: Vec<(u64, u32)> = Vec::with_capacity(rows.len());
     let mut empty: Vec<u32> = Vec::new();
@@ -698,12 +865,16 @@ pub fn sort_rows(
     if cancel.load(Relaxed) {
         return false;
     }
-    let sorted: Vec<u32> = items
+    drop(parts);
+    // Items hold view positions; turn them into tie-breakers for `finish_sort`.
+    let order: Vec<u32> = items
         .iter()
-        .map(|&(_, i)| rows[i as usize])
-        .chain(empty.iter().map(|&i| rows[i as usize]))
+        .map(|&(_, i)| i)
+        .chain(empty)
+        .map(|i| tie(i as usize, rows[i as usize]))
         .collect();
-    *rows = sorted;
+    drop(items);
+    finish_sort(rows, ascending, order.into_iter());
     true
 }
 
@@ -949,7 +1120,7 @@ pub fn export_csv(
 ) -> anyhow::Result<u64> {
     let tmp = path.with_extension("rowscope-tmp");
     let file = std::fs::File::create(&tmp)?;
-    let mut w = std::io::BufWriter::with_capacity(4 << 20, file);
+    let mut w = std::io::BufWriter::with_capacity(256 << 10, file);
     let mut line = Vec::with_capacity(4096);
     if let Some(h) = header {
         for (i, name) in h.iter().enumerate().take(ncols) {
@@ -961,8 +1132,26 @@ pub fn export_csv(
         line.push(b'\n');
         w.write_all(&line)?;
     }
-    let raw_ok = data.format == RowFormat::Delimited { delim: b',' };
-    // Encode blocks of rows in parallel, write them in order.
+    let map: &[u8] = data.map.as_deref().map_or(&[], |m| &m[..]);
+    let raw_ok = data.format == RowFormat::Delimited { delim: b',' } && !map.is_empty();
+    /// A piece of output: bytes of the mapped file, or of a block's own
+    /// buffer (rows that had to be re-encoded).
+    #[derive(Clone, Copy)]
+    enum Seg {
+        Map(usize, usize),
+        Own(usize, usize),
+    }
+    /// Appends `seg`, merging it into the last piece when they touch.
+    fn push(segs: &mut Vec<Seg>, seg: Seg) {
+        match (segs.last_mut(), seg) {
+            (Some(Seg::Map(_, e)), Seg::Map(s2, e2)) if *e == s2 => *e = e2,
+            (Some(Seg::Own(_, e)), Seg::Own(s2, e2)) if *e == s2 => *e = e2,
+            _ => segs.push(seg),
+        }
+    }
+    // Encode blocks of rows in parallel, write them in order. Unedited rows
+    // of a comma-separated source are written straight from the mapped
+    // file, so consecutive rows go out as one slice without being copied.
     const BLOCK: u64 = 32_768;
     let mut at = 0u64;
     while at < count {
@@ -972,17 +1161,24 @@ pub fn export_csv(
             return Err(anyhow::anyhow!("cancelled"));
         }
         let hi = (at + BLOCK * rayon::current_num_threads() as u64).min(count);
-        let blocks: Vec<Vec<u8>> = (at..hi)
+        let blocks: Vec<(Vec<u8>, Vec<Seg>)> = (at..hi)
             .step_by(BLOCK as usize)
             .collect::<Vec<_>>()
             .into_par_iter()
             .map(|lo| {
-                let mut out = Vec::with_capacity(1 << 20);
+                let mut out = Vec::new();
+                let mut segs = Vec::new();
                 for vr in lo..(lo + BLOCK).min(hi) {
                     let phys = view(vr) + first;
                     if raw_ok && !edits.rows.contains(&phys) {
-                        out.extend_from_slice(data.row_bytes(phys));
+                        let (s, e) = data.row_span(phys);
+                        if map.get(e) == Some(&b'\n') {
+                            push(&mut segs, Seg::Map(s, e + 1));
+                            continue;
+                        }
+                        push(&mut segs, Seg::Map(s, e));
                     } else {
+                        let at = out.len();
                         let fields = row_with_edits(data, edits, phys, ncols);
                         for (i, f) in fields.iter().enumerate() {
                             if i > 0 {
@@ -990,14 +1186,21 @@ pub fn export_csv(
                             }
                             csv::write_field(&mut out, f, b',');
                         }
+                        push(&mut segs, Seg::Own(at, out.len()));
                     }
                     out.push(b'\n');
+                    push(&mut segs, Seg::Own(out.len() - 1, out.len()));
                 }
-                out
+                (out, segs)
             })
             .collect();
-        for b in blocks {
-            w.write_all(&b)?;
+        for (out, segs) in &blocks {
+            for &seg in segs {
+                w.write_all(match seg {
+                    Seg::Map(s, e) => &map[s..e],
+                    Seg::Own(s, e) => &out[s..e],
+                })?;
+            }
         }
         progress.store(hi, Relaxed);
         at = hi;
@@ -1192,6 +1395,94 @@ mod tests {
     }
 
     #[test]
+    fn several_filters() {
+        let num = ColFilter {
+            col: 2,
+            cond: Cond::Num {
+                op: NumOp::Gt,
+                a: 6.0,
+                b: 0.0,
+            },
+        };
+        let text = ColFilter {
+            col: 0,
+            cond: Cond::Text {
+                op: TextOp::NotEquals,
+                needle: "ann".into(),
+            },
+        };
+        let blank: FxHashSet<Box<[u8]>> = [b"".as_slice().into()].into_iter().collect();
+        // Column 7 is past the end of every row, so it reads as blank.
+        let past = ColFilter {
+            col: 7,
+            cond: Cond::Values {
+                set: Arc::new(blank),
+                exclude: false,
+            },
+        };
+        assert_eq!(q("", vec![num.clone(), text.clone()], None), vec![2]);
+        assert_eq!(q("", vec![text.clone(), num.clone()], None), vec![2]);
+        assert_eq!(q("", vec![past.clone(), num.clone()], None), vec![0, 2]);
+        let Cond::Values { set, .. } = past.cond else {
+            unreachable!()
+        };
+        let not_blank = ColFilter {
+            col: 7,
+            cond: Cond::Values { set, exclude: true },
+        };
+        assert_eq!(q("", vec![num, not_blank], None), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn export_rows() {
+        let dir = std::env::temp_dir().join(format!("rowscope-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.csv");
+        std::fs::write(&src, "h1,h2\na,1\r\nb,\"x\ny\"\nc,3\nd,4").unwrap();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        csv::load(&src, &tx, &AtomicBool::new(false)).unwrap();
+        drop(tx);
+        let mut data = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let super::super::LoadEvent::Done { data: d, .. } = ev {
+                data = Some(d);
+            }
+        }
+        let data = data.unwrap();
+        let out = dir.join("out.csv");
+        let export = |view: &[u64], edits: &Edits| {
+            let header = ["h1".to_string(), "h2".to_string()];
+            export_csv(
+                &out,
+                &data,
+                1,
+                Some(&header),
+                view.len() as u64,
+                &|r| view[r as usize],
+                2,
+                edits,
+                &AtomicU64::new(0),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            std::fs::read_to_string(&out).unwrap()
+        };
+        let none = Edits::default();
+        assert_eq!(
+            export(&[0, 1, 2, 3], &none),
+            "h1,h2\na,1\nb,\"x\ny\"\nc,3\nd,4\n"
+        );
+        assert_eq!(export(&[3, 0, 2], &none), "h1,h2\nd,4\na,1\nc,3\n");
+        let mut e = Edits::default();
+        e.set(3, 1, "has,comma".into());
+        assert_eq!(
+            export(&[1, 2, 3], &e),
+            "h1,h2\nb,\"x\ny\"\nc,\"has,comma\"\nd,4\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn number_keys_keep_order() {
         let v = [-1e9, -2.5, -0.0, 0.0, 1e-9, 3.0, 1e300];
         for w in v.windows(2) {
@@ -1241,6 +1532,115 @@ mod tests {
             &AtomicBool::new(false),
         );
         assert_eq!(rows, vec![0, 3, 4, 2, 6, 1, 5]);
+    }
+
+    /// Every sort path against a plain stable sort, on ascending and
+    /// shuffled views and on columns with few and with many distinct values.
+    #[test]
+    fn sort_paths_match_naive() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let words = [
+            "apple",
+            "Banana",
+            "cherry",
+            "",
+            "  date ",
+            "Éclair",
+            "apple pie",
+            "-3.5",
+            "12",
+            "1e3",
+            "abcdefghijklmnopqrstu",
+            "abcdefghijklmnopqrstv",
+        ];
+        let mut cells: Vec<String> = vec!["k".into()];
+        for i in 0..3000 {
+            let w = words[next() as usize % words.len()];
+            // Column 0: few distinct values; column 1: mostly unique.
+            cells.push(format!(
+                "{w}\u{1f}{w}{}",
+                if i % 7 == 0 {
+                    String::new()
+                } else {
+                    (next() % 100_000).to_string()
+                }
+            ));
+        }
+        let mut buf = Vec::new();
+        let mut starts = vec![0u64];
+        for c in &cells {
+            buf.extend_from_slice(c.as_bytes());
+            starts.push(buf.len() as u64);
+        }
+        let d = Data {
+            map: None,
+            format: RowFormat::Packed,
+            chunks: Arc::new(vec![Arc::new(super::super::Chunk {
+                offsets: super::super::Offsets::build(&starts),
+                owned: Some(buf),
+            })]),
+            rows: cells.len() as u64,
+        };
+        let e = Edits::default();
+        let n = cells.len() as u32 - 1;
+        let asc: Vec<u32> = (0..n).collect();
+        let mut shuffled = asc.clone();
+        for i in (1..shuffled.len()).rev() {
+            shuffled.swap(i, next() as usize % (i + 1));
+        }
+        for view in [asc, shuffled] {
+            for col in 0..2 {
+                for desc in [false, true] {
+                    for numeric in [false, true] {
+                        let spec = SortSpec { col, desc, numeric };
+                        let mut got = view.clone();
+                        assert!(sort_rows(
+                            &d,
+                            1,
+                            &mut got,
+                            spec,
+                            &e,
+                            &AtomicBool::new(false)
+                        ));
+                        let text = |r: u32| d.cell(r as u64 + 1, col).into_owned();
+                        let mut want = view.clone();
+                        if numeric {
+                            let k = |r: u32| parse_number(&text(r)).filter(|v| !v.is_nan());
+                            want.sort_by(|&a, &b| match (k(a), k(b)) {
+                                (Some(x), Some(y)) if desc => y.partial_cmp(&x).unwrap(),
+                                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap(),
+                                (Some(_), None) => Ordering::Less,
+                                (None, Some(_)) => Ordering::Greater,
+                                (None, None) => Ordering::Equal,
+                            });
+                        } else {
+                            let k = |r: u32| {
+                                let mut v = Vec::new();
+                                lower_key(&text(r), &mut v);
+                                v
+                            };
+                            want.sort_by(|&a, &b| {
+                                let (ka, kb) = (k(a), k(b));
+                                match (ka.is_empty(), kb.is_empty()) {
+                                    (true, true) => Ordering::Equal,
+                                    (true, false) => Ordering::Greater,
+                                    (false, true) => Ordering::Less,
+                                    _ if desc => kb.cmp(&ka),
+                                    _ => ka.cmp(&kb),
+                                }
+                            });
+                        }
+                        assert_eq!(got, want, "{spec:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
