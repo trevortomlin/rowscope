@@ -17,7 +17,7 @@ name = "rowscope"
 path = "src/main.rs"
 
 [dependencies]
-# gpui-fast pinned to the same commit as filebrowserrs and taskmanager-rs. Bump `rev` deliberately.
+# gpui-fast pinned to the same commit as Warren and Tidewatch. Bump `rev` deliberately.
 gpui = { git = "https://github.com/trevortomlin/gpui-fast", rev = "2c472d8e55426ad988a6d0d6f0c2f677a6c2dc53" }
 gpui_platform = { git = "https://github.com/trevortomlin/gpui-fast", rev = "2c472d8e55426ad988a6d0d6f0c2f677a6c2dc53", features = ["wayland", "x11"] }
 anyhow = "1"

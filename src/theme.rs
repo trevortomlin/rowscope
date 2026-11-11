@@ -1,4 +1,4 @@
-//! Colors: the same calm dark palette as Files and Disk Usage.
+//! Colors: the same calm dark palette as Warren and Quarry.
 
 use gpui::{Hsla, hsla, rgb};
 

@@ -18,9 +18,11 @@ Spreadsheet apps stop at about a million rows and slow down well before that. Ro
 10-million-row CSV in about a tenth of a second (once it's in the page cache; the first rows
 show in milliseconds either way) and searches, filters and sorts it in milliseconds,
 while keeping the familiar spreadsheet layout: column letters, a name box, a formula bar,
-AutoFilter-style column menus and selection totals. It's a sibling of
-[Disk Usage](https://github.com/trevortomlin/disk-usage-rs) and
-[taskmanager-rs](https://github.com/trevortomlin/taskmanager-rs) and shares their look.
+AutoFilter-style column menus and selection totals.
+
+It's part of a family of fast Linux apps that share one look:
+[Tidewatch](https://github.com/trevortomlin/tidewatch) (task manager),
+[Quarry](https://github.com/trevortomlin/quarry) (disk usage) and Warren (file manager).
 
 ![10 million rows, searched, filtered and sorted](docs/filtered.png)
 
